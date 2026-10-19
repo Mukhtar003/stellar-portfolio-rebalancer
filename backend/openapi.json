@@ -1446,28 +1446,6 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "options": {
-                    "type": "object",
-                    "properties": {
-                      "slippageOverrides": {
-                        "type": "object",
-                        "additionalProperties": {
-                          "type": "number"
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        },
         "responses": {
           "200": {
             "description": "Dry-run preview",
@@ -1481,16 +1459,6 @@
           },
           "400": {
             "description": "Validation error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiError"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -1758,7 +1726,7 @@
           "Portfolio"
         ],
         "summary": "Get tax report",
-        "description": "Realized gain/loss tax report computed with FIFO cost basis for a tax year.",
+        "description": "Realized gain/loss tax report for a tax year. Lots are matched using the selected cost-basis method (FIFO by default). `format=turbotax` returns a TurboTax-importable CSV with the columns: Currency Name, Purchase Date, Cost Basis, Date Sold, Proceeds.",
         "parameters": [
           {
             "name": "year",
@@ -1777,15 +1745,30 @@
               "type": "string",
               "enum": [
                 "json",
-                "csv"
+                "csv",
+                "turbotax"
               ],
               "default": "json"
+            }
+          },
+          {
+            "name": "costBasisMethod",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "fifo",
+                "lifo",
+                "hifo"
+              ],
+              "default": "fifo",
+              "description": "Lot-matching method used to determine cost basis"
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "Tax report summary (JSON) or CSV download (format=csv)",
+            "description": "Tax report summary (JSON) or CSV download (format=csv or format=turbotax)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1800,7 +1783,7 @@
             }
           },
           "400": {
-            "description": "Invalid year",
+            "description": "Invalid year or costBasisMethod",
             "content": {
               "application/json": {
                 "schema": {
@@ -2683,6 +2666,92 @@
         }
       }
     },
+    "/api/status": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Public connectivity status",
+        "description": "Unauthenticated, cache-friendly status report for the Reflector oracle and the Stellar DEX, built from live probes (oracle reachability plus Horizon strict-send route finding). Always answers 200; the body carries the health. Use /api/health for a machine liveness gate.",
+        "responses": {
+          "200": {
+            "description": "Public connectivity report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "healthy",
+                            "degraded",
+                            "unhealthy"
+                          ]
+                        },
+                        "timestamp": {
+                          "type": "string",
+                          "format": "date-time"
+                        },
+                        "checks": {
+                          "type": "object",
+                          "properties": {
+                            "reflector_oracle": {
+                              "$ref": "#/components/schemas/PublicStatusCheck"
+                            },
+                            "stellar_dex": {
+                              "$ref": "#/components/schemas/PublicStatusCheck"
+                            }
+                          }
+                        },
+                        "cache": {
+                          "type": "object",
+                          "properties": {
+                            "cached": {
+                              "type": "boolean"
+                            },
+                            "age_ms": {
+                              "type": "integer"
+                            },
+                            "ttl_ms": {
+                              "type": "integer"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "object",
+                      "nullable": true
+                    },
+                    "timestamp": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/system/status": {
       "get": {
         "tags": [
@@ -3361,6 +3430,48 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "PublicStatusCheck": {
+        "type": "object",
+        "required": [
+          "status",
+          "last_checked",
+          "latency_ms",
+          "reason",
+          "message"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded",
+              "down"
+            ],
+            "example": "ok"
+          },
+          "last_checked": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "example": 84
+          },
+          "reason": {
+            "type": "string",
+            "example": "ok",
+            "description": "Probe-specific reason code, e.g. oracle: ok/not_configured/unreachable/timeout/http_error/no_data/stale; DEX: ok/no_path/timeout/http_error/api_unavailable/unsupported_asset/error."
+          },
+          "message": {
+            "type": "string",
+            "example": "Reflector oracle is reachable and serving fresh quotes."
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": true
           }
         }
       },

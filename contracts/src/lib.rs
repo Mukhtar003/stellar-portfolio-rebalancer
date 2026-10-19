@@ -12,13 +12,14 @@ mod events;
 mod nav;
 mod oracle;
 mod portfolio;
+mod portfolio_ops;
 mod reflector;
 mod slippage;
 mod stop_loss;
 mod strategies;
 mod templates;
 mod upgrade;
-#[cfg(all(test, feature = "testutils"))]
+#[cfg(test)]
 mod test;
 #[cfg(all(test, feature = "testutils"))]
 mod property_tests;
@@ -33,11 +34,6 @@ pub use strategies::*;
 
 #[contract]
 pub struct PortfolioRebalancer;
-
-fn validate_slippage_policy_version(version: u32) -> bool {
-    version == CURRENT_SLIPPAGE_POLICY_VERSION
-}
-
 
 fn guard_ledger_timestamp(env: &Env) -> u64 {
     let current = env.ledger().timestamp();
@@ -74,9 +70,7 @@ impl PortfolioRebalancer {
             return Err(Error::AlreadyInitialized);
         }
 
-        // Lightweight validation: call base() on the provided address.
-        // If the call fails (host error) or returns an unexpected type, the
-        // address is not a valid Reflector oracle.
+        
         let reflector_client = ReflectorClient::new(&env, &reflector_address);
         match reflector_client.try_base() {
             Ok(Ok(_asset)) => {}
@@ -138,7 +132,7 @@ impl PortfolioRebalancer {
 
     /// Step 2 of the two-step admin transfer: the pending admin claims the role.
     ///
-    /// Callable only by the address stored by [`propose_admin`] — it must
+    
     /// authorize this call itself, which is what proves the incoming admin
     /// controls the key. On success `DataKey::Admin` is rewritten, the
     /// pending nomination is cleared, and the previous admin loses every
@@ -296,7 +290,17 @@ impl PortfolioRebalancer {
         if !validate_asset_decimals(&target_allocations, &asset_decimals) {
             return Err(Error::InvalidAssetDecimals);
         }
-        if target_allocations.len() > MAX_PORTFOLIO_ASSETS {
+        let user_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserPortfolioCount(user.clone()))
+            .unwrap_or(0);
+        let max_portfolios = Self::max_portfolios_per_user(env.clone());
+        if user_count >= max_portfolios {
+            return Err(Error::TooManyPortfolios);
+        }
+        let max_assets = Self::max_portfolio_assets(env.clone());
+        if target_allocations.len() > max_assets {
             return Err(Error::TooManyAssets);
         }
         if !(MIN_REBALANCE_THRESHOLD..=MAX_REBALANCE_THRESHOLD).contains(&rebalance_threshold) {
@@ -346,16 +350,31 @@ impl PortfolioRebalancer {
             .set(&DataKey::NextPortfolioId, &(portfolio_id + 1));
         portfolio::check_portfolio_invariants(&portfolio)?;
 
-        // Store under V2 key (strategy-aware schema).
+       
         env.storage()
             .persistent()
             .set(&DataKey::PortfolioV2(portfolio_id), &portfolio);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserPortfolioCount(user.clone()), &(user_count + 1));
         portfolio::emit_portfolio_created(&env, portfolio_id, user);
         Ok(portfolio_id)
     }
 
     pub fn get_portfolio(env: Env, portfolio_id: u64) -> Portfolio {
         Self::load_portfolio(&env, portfolio_id).unwrap()
+    }
+
+    /// Move `pct_to_new` percent of every asset into a new portfolio owned by
+    /// the same user. The percentage must be between 1 and 99 (inclusive).
+    pub fn split_portfolio(env: Env, source_id: u64, pct_to_new: u32) -> Result<u64, Error> {
+        portfolio_ops::split_portfolio(&env, source_id, pct_to_new)
+    }
+
+    /// Merge `source_id` into `target_id`, preserving asset balances and
+    /// weighting target allocations by the portfolios' stored values.
+    pub fn merge_portfolios(env: Env, source_id: u64, target_id: u64) -> Result<(), Error> {
+        portfolio_ops::merge_portfolios(&env, source_id, target_id)
     }
 
     pub fn check_invariants(env: Env, portfolio_id: u64) -> Result<(), Error> {
@@ -415,10 +434,6 @@ impl PortfolioRebalancer {
     ) -> Result<(), Error> {
         if amount <= 0 {
             return Err(Error::InvalidWithdrawAmount);
-        }
-
-        if let Some(true) = env.storage().instance().get(&DataKey::EmergencyStop) {
-            return Err(Error::EmergencyStop);
         }
 
         let mut portfolio = Self::load_portfolio(&env, portfolio_id)?;
@@ -562,25 +577,21 @@ impl PortfolioRebalancer {
     /// `upgrade`, `set_fee_config` remain Admin-only).
     pub fn add_operator(env: Env, operator: Address) {
         require_admin(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         env.storage()
             .persistent()
             .set(&DataKey::Operator(operator.clone()), &true);
-        env.events().publish(
-            (Symbol::new(&env, "operator_added"),),
-            operator,
-        );
+        events::emit_operator_added(&env, &admin, &operator);
     }
 
     /// Admin-only: revoke a previously registered operator.
     pub fn remove_operator(env: Env, operator: Address) {
         require_admin(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         env.storage()
             .persistent()
             .remove(&DataKey::Operator(operator.clone()));
-        env.events().publish(
-            (Symbol::new(&env, "operator_removed"),),
-            operator,
-        );
+        events::emit_operator_removed(&env, &admin, &operator);
     }
 
     /// Whether `address` is currently a registered operator.
@@ -713,12 +724,12 @@ impl PortfolioRebalancer {
         ContractCapabilitySummary {
             version: Self::version(env.clone()),
             schema_version: Self::schema_version(env.clone()),
-            capability_flags: Self::capabilities(env),
+            capability_flags: Self::capabilities(env.clone()),
             min_rebalance_threshold: MIN_REBALANCE_THRESHOLD,
             max_rebalance_threshold: MAX_REBALANCE_THRESHOLD,
             min_slippage_tolerance_bps: MIN_SLIPPAGE_TOLERANCE_BPS,
             max_slippage_tolerance_bps: MAX_SLIPPAGE_TOLERANCE_BPS,
-            max_portfolio_assets: MAX_PORTFOLIO_ASSETS,
+            max_portfolio_assets: Self::max_portfolio_assets(env),
         }
     }
 
@@ -915,8 +926,51 @@ impl PortfolioRebalancer {
         MAX_SLIPPAGE_TOLERANCE_BPS
     }
 
-    pub fn max_portfolio_assets(_env: Env) -> u32 {
-        MAX_PORTFOLIO_ASSETS
+    pub fn max_portfolio_assets(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPortfolioAssets)
+            .unwrap_or(MAX_PORTFOLIO_ASSETS)
+    }
+
+    pub fn set_max_portfolio_assets(env: Env, max_assets: u32) -> Result<(), Error> {
+        require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPortfolioAssets, &max_assets);
+        Ok(())
+    }
+
+    pub fn max_portfolios_per_user(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPortfoliosPerUser)
+            .unwrap_or(MAX_PORTFOLIOS_PER_USER)
+    }
+
+    pub fn set_max_portfolios_per_user(env: Env, max_portfolios: u32) -> Result<(), Error> {
+        require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPortfoliosPerUser, &max_portfolios);
+        Ok(())
+    }
+
+    pub fn get_user_portfolio_count(env: Env, user: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserPortfolioCount(user))
+            .unwrap_or(0)
+    }
+
+    pub fn get_rebalance_history(env: Env, portfolio_id: u64) -> Vec<RebalanceRecord> {
+        let history_key = DataKey::RebalanceHistory(portfolio_id);
+        let history: RebalanceHistoryBuffer = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| RebalanceHistoryBuffer::new(&env, DEFAULT_REBALANCE_HISTORY_CAPACITY));
+        history.records
     }
 
     pub fn preview_rebalance(env: Env, portfolio_id: u64) -> RebalancePreview {
@@ -1096,6 +1150,10 @@ impl PortfolioRebalancer {
         let mut portfolio = Self::load_portfolio(&env, portfolio_id)?;
         
         portfolio.user.require_auth();
+
+        if spike_threshold_bps == 0 || spike_threshold_bps > 10000 {
+            return Err(Error::InvalidAssetThreshold);
+        }
         
         portfolio.circuit_breaker_config = CircuitBreakerConfig {
             spike_threshold_bps,
@@ -1114,6 +1172,13 @@ impl PortfolioRebalancer {
         Ok(())
     }
 
+    /// Set a portfolio's aggregate ("global") max slippage cap, applied to the
+    /// sum of per-leg slippage across all assets during a rebalance.
+    ///
+    /// The value is bounded by [`MAX_GLOBAL_MAX_SLIPPAGE_BPS`] (1000 bps / 10%):
+    /// larger values are rejected with [`Error::InvalidSlippageTolerance`] so a
+    /// malformed or malicious request can never disable the contract-level
+    /// aggregate slippage defense (#1856).
     pub fn set_global_max_slippage(
         env: Env,
         portfolio_id: u64,
@@ -1122,7 +1187,11 @@ impl PortfolioRebalancer {
         let mut portfolio = Self::load_portfolio(&env, portfolio_id)?;
         
         portfolio.user.require_auth();
-        
+
+        if global_max_slippage_bps > MAX_GLOBAL_MAX_SLIPPAGE_BPS {
+            return Err(Error::InvalidSlippageTolerance);
+        }
+
         portfolio.global_max_slippage_bps = global_max_slippage_bps;
         
         env.storage()
@@ -1315,16 +1384,21 @@ impl PortfolioRebalancer {
             if let Some(reason) = preview.skip_reasons.get(asset) {
                 match reason {
                     AssetSkipReason::MissingPrice => return Err(Error::MissingPrice),
-                    AssetSkipReason::StalePrice => return Err(Error::StaleData),
+                    AssetSkipReason::StalePrice => return Err(Error::StaleOraclePrice),
                     _ => {}
                 }
             }
         }
 
-        let total_value = preview.total_value;
-        let mut snapshot = portfolio.clone();
-        snapshot.total_value = total_value;
+        for (asset, _) in portfolio.target_allocations.iter() {
+            if let Some(decision) = preview.threshold_decisions.get(asset.clone()) {
+                if decision.drift > ALLOCATION_DENOMINATOR / 2 {
+                    return Err(Error::ExcessiveDrift);
+                }
+            }
+        }
 
+        let total_value = preview.total_value;
         let trades = preview.candidate_trades;
 
         let fee_config = Self::get_fee_config(env.clone());
@@ -1372,38 +1446,59 @@ impl PortfolioRebalancer {
                     } else {
                         -expected_balance
                     };
+
+                    // Contract-level per-asset slippage guard (#962, fail-closed
+                    // per #1856): runs for every leg of a trade-related state
+                    // change, before any balance mutation. Malformed inputs (a
+                    // zero/negative oracle price, or a reported balance that would
+                    // imply a non-positive execution price) are rejected outright.
+                    if price <= 0 || actual_balance < 0 {
+                        return Err(Error::InvalidPrice);
+                    }
                     if expected_abs > 0 {
                         let diff = expected_balance - actual_balance;
                         let diff_abs = if diff >= 0 { diff } else { -diff };
                         let slippage_bps = (diff_abs * 10000) / expected_abs;
-                        
+
                         // Per-asset slippage check (existing behavior)
-                        if slippage_bps > snapshot.slippage_tolerance as i128 {
+                        if slippage_bps > portfolio.slippage_tolerance as i128 {
                             return Err(Error::SlippageExceeded);
                         }
-                        
-                        // Contract-level per-asset slippage guard (#962): derive the
-                        // effective DEX execution price from the reported balances and
-                        // enforce the admin-configurable asset-class limit (default 1%,
-                        // max 5%). `actual_price = expected_price * actual_balance /
-                        // expected_balance` keeps the measured deviation identical to the
-                        // balance-based `slippage_bps` above, so the portfolio-level and
-                        // contract-level checks stay consistent.
+
+                        // `actual_price = expected_price * actual_balance /
+                        // expected_balance` keeps the measured deviation identical
+                        // to the balance-based `slippage_bps` above, so the
+                        // portfolio-level and contract-level checks stay consistent.
+                        // The guarded variant fail-closes on `actual_price <= 0` and
+                        // on absurd (> +1000%) positive deviations.
                         let actual_price = (price * actual_balance) / expected_balance;
-                        slippage::check_execution_slippage(env, &asset, price, actual_price)?;
+                        slippage::check_execution_slippage_guarded(env, &asset, price, actual_price)?;
                         // Accumulate for global slippage check
                         total_slippage_bps += slippage_bps;
+                    } else if actual_balance != 0 {
+                        // No expected leg to measure deviation against, yet the
+                        // caller reports a balance: fail closed rather than let a
+                        // malformed request bypass the slippage guard.
+                        return Err(Error::SlippageExceeded);
                     }
                 }
-                
-                // Global slippage cap check across all legs
-                if total_slippage_bps > portfolio.global_max_slippage_bps as i128 {
+
+                // Global slippage cap check across all legs. The stored cap is
+                // clamped to MAX_GLOBAL_MAX_SLIPPAGE_BPS (#1856) so a cap written
+                // before that bound existed cannot disable the aggregate check.
+                let global_cap_bps = slippage::cap_global_max_slippage_bps(portfolio.global_max_slippage_bps);
+                if total_slippage_bps > global_cap_bps as i128 {
                     return Err(Error::SlippageExceeded);
                 }
             }
         }
 
+        if trades.is_empty() && total_value > 0 {
+            return Err(Error::RebalanceNotNeeded);
+        }
+
         let contract_address = env.current_contract_address();
+        let mut total_fee_paid: i128 = 0;
         for (asset, amount) in trades.iter() {
             let abs_amount = amount.abs();
             let fee_amount = if effective_fee_bps > 0 {
@@ -1411,6 +1506,7 @@ impl PortfolioRebalancer {
             } else {
                 0
             };
+            total_fee_paid += fee_amount;
             let effective_amount = amount - fee_amount;
 
             let token_client = TokenClient::new(env, &asset);
@@ -1444,6 +1540,20 @@ impl PortfolioRebalancer {
             .persistent()
             .set(&DataKey::PortfolioV2(portfolio_id), &portfolio);
 
+        let record = RebalanceRecord {
+            timestamp: current_time,
+            trades: trades.clone(),
+            fee_paid: total_fee_paid,
+        };
+        let history_key = DataKey::RebalanceHistory(portfolio_id);
+        let mut history: RebalanceHistoryBuffer = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| RebalanceHistoryBuffer::new(env, DEFAULT_REBALANCE_HISTORY_CAPACITY));
+        history.push(record);
+        env.storage().persistent().set(&history_key, &history);
+
         if let Some(admin) = override_admin {
             portfolio::emit_cooldown_override(env, portfolio_id, admin, current_time);
         }
@@ -1465,6 +1575,45 @@ impl PortfolioRebalancer {
 
     pub fn get_nav_history(env: Env, portfolio_id: u64, limit: u32) -> Result<Vec<NavSnapshot>, Error> {
         nav::get_nav_history(&env, portfolio_id, limit)
+    }
+
+    pub fn sweep_dust(env: Env, portfolio_id: u64) -> Result<(), Error> {
+        require_admin(&env);
+
+        let mut portfolio = Self::load_portfolio(&env, portfolio_id)?;
+        let fee_config = Self::get_fee_config(env.clone());
+        let destination = fee_config.fee_recipient;
+
+        let mut swept_amounts: Map<Address, i128> = Map::new(&env);
+        let mut dust_assets: Vec<Address> = Vec::new(&env);
+
+        for (asset, balance) in portfolio.current_balances.iter() {
+            if balance > 0 && balance < MIN_TRADE_AMOUNT_STROOPS {
+                let token_client = TokenClient::new(&env, &asset);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &destination,
+                    &balance,
+                );
+                swept_amounts.set(asset.clone(), balance);
+                dust_assets.push_back(asset.clone());
+            }
+        }
+
+        for asset in dust_assets.iter() {
+            portfolio.current_balances.remove(asset.clone());
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PortfolioV2(portfolio_id), &portfolio);
+
+        env.events().publish(
+            (Symbol::new(&env, "dust_swept"),),
+            (portfolio_id, swept_amounts, destination),
+        );
+
+        Ok(())
     }
 
     pub fn close_portfolio(env: Env, portfolio_id: u64) -> Result<(), Error> {
@@ -1509,6 +1658,23 @@ impl PortfolioRebalancer {
         env.storage()
             .persistent()
             .remove(&DataKey::NavHistory(portfolio_id));
+
+        // Remove rebalance history if exists
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RebalanceHistory(portfolio_id));
+
+        // Decrement portfolio count for user
+        let user_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserPortfolioCount(portfolio.user.clone()))
+            .unwrap_or(0);
+        if user_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::UserPortfolioCount(portfolio.user.clone()), &(user_count - 1));
+        }
         
         // Emit portfolio_closed event
         env.events().publish(
